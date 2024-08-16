@@ -1,0 +1,529 @@
+package ge2e
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/cloudflare/circl/cipher/ascon"
+	"github.com/cloudflare/circl/kem"
+	"github.com/cloudflare/circl/kem/hybrid"
+	"github.com/cloudflare/circl/sign/eddilithium3"
+)
+
+type AdminRoomToken struct {
+	Version int    `json:"Version"`
+	RoomId  int    `json:"RoomId"`
+	SK      string `json:"SK"`
+	RK      string `json:"RK"`
+}
+
+type RoomToken struct {
+	Version int    `json:"Version"`
+	RoomId  int    `json:"RoomId"`
+	VK      string `json:"VK"`
+	RK      string `json:"RK"`
+}
+
+type PermToken struct {
+	Version int            `json:"Version"`
+	RoomId  int            `json:"RoomId"`
+	Perm    map[string]int `json:"Perm"`
+}
+
+type FileKeys struct {
+	Version int                  `json:"Version"`
+	Keys    map[string][2]string `json:"Keys"`
+}
+
+func CreateDataroom(dataroompath string, username string, key []byte) {
+	// Generates SK keypair.
+	_, sk, err := eddilithium3.GenerateKey(nil)
+	if err != nil {
+		panic(err)
+	}
+
+	// Create RoomKey RK
+	RK := make([]byte, 16)
+	if _, err := rand.Read(RK); err != nil {
+		panic(err)
+	}
+
+	// Create AdminToken
+	ad := AdminRoomToken{1, 1, hex.EncodeToString(sk.Bytes()), hex.EncodeToString(RK)}
+	jsonAdminToken, err := json.Marshal(ad)
+	if err != nil {
+		panic(err)
+	}
+
+	// encrypt AdminToken
+	iv := make([]byte, 16)
+	if _, err := rand.Read(iv); err != nil {
+		panic(err)
+	}
+
+	mode := ascon.Ascon128
+	a, err := ascon.New(key, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	// store AdminToken
+	err = os.WriteFile(dataroompath+"/.meta/"+username+"/AdminToken", iv, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	file, err := os.OpenFile(dataroompath+"/.meta/"+username+"/AdminToken", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	if _, err := file.Write(a.Seal(jsonAdminToken[:0], iv, jsonAdminToken, nil)); err != nil {
+		panic(err)
+	}
+
+	// Create Permission Token
+	var pe = make(map[string]int)
+	pe[username] = 3
+	pt := PermToken{1, 1, pe}
+	jsonPermToken, err := json.Marshal(pt)
+	if err != nil {
+		panic(err)
+	}
+
+	// Sign perm token
+	var signature [eddilithium3.SignatureSize]byte
+	eddilithium3.SignTo(sk, jsonPermToken, signature[:])
+
+	err = os.WriteFile(dataroompath+"/.meta/PermToken.sig", signature[:], 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	f, err := os.Create(dataroompath + "/.meta/PermToken")
+	if err != nil {
+		panic(err)
+	}
+
+	defer f.Close()
+
+	_, err = f.WriteString(string(jsonPermToken) + "\n")
+	if err != nil {
+		panic(err)
+	}
+
+	// Create FileKey File
+	k := make(map[string][2]string)
+	fk := FileKeys{1, k}
+	jsonFileKey, err := json.Marshal(fk)
+	if err != nil {
+		panic(err)
+	}
+
+	// encrypt FileKey File
+	ivfk := make([]byte, 16)
+	if _, err := rand.Read(ivfk); err != nil {
+		panic(err)
+	}
+
+	afk, err := ascon.New(RK, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	err = os.WriteFile(dataroompath+"/.meta/Filekeys", ivfk, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	filefk, err := os.OpenFile(dataroompath+"/.meta/Filekeys", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer filefk.Close()
+
+	if _, err := filefk.Write(afk.Seal(jsonFileKey[:0], ivfk, jsonFileKey, nil)); err != nil {
+		panic(err)
+	}
+}
+
+func UploadFile(dataroompath string, file string, username string, key []byte) {
+	admintoken := LoadAdminToken(key, dataroompath+"/.meta/"+username+"/AdminToken")
+
+	rk, err := hex.DecodeString(admintoken.RK)
+	if err != nil {
+		panic(err)
+	}
+
+	filekeys := LoadFileKeys(rk, dataroompath+"/.meta/Filekeys")
+
+	// check file already exists
+	filename := filepath.Base(file)
+	if _, ok := filekeys.Keys[filename]; ok {
+		fmt.Println("File " + filename + " already exits in dataroom " + dataroompath)
+		os.Exit(0)
+	}
+
+	// increment version
+	filekeys.Version += 1
+
+	// create file key
+	fk := make([]byte, 16)
+	if _, err := rand.Read(fk); err != nil {
+		panic(err)
+	}
+
+	// create random filename
+	fn := make([]byte, 32)
+	if _, err := rand.Read(fn); err != nil {
+		panic(err)
+	}
+
+	filekeys.Keys[filename] = [2]string{hex.EncodeToString(fk), hex.EncodeToString(fn)}
+
+	jsonFileKey, err := json.Marshal(filekeys)
+	if err != nil {
+		panic(err)
+	}
+
+	// encrypt + write file
+	ivf := make([]byte, 16)
+	if _, err := rand.Read(ivf); err != nil {
+		panic(err)
+	}
+
+	mode := ascon.Ascon128
+	af, err := ascon.New(fk, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	err = os.WriteFile(dataroompath+"/"+hex.EncodeToString(fn), ivf, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	filef, err := os.OpenFile(dataroompath+"/"+hex.EncodeToString(fn), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer filef.Close()
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		panic(err)
+	}
+
+	if _, err := filef.Write(af.Seal(data[:0], ivf, data, nil)); err != nil {
+		panic(err)
+	}
+
+	fmt.Println(string(jsonFileKey))
+
+	// encrypt + write FileKey File
+	ivfk := make([]byte, 16)
+	if _, err := rand.Read(ivfk); err != nil {
+		panic(err)
+	}
+
+	afk, err := ascon.New(rk, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	err = os.WriteFile(dataroompath+"/.meta/Filekeys", ivfk, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	filefk, err := os.OpenFile(dataroompath+"/.meta/Filekeys", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer filefk.Close()
+
+	if _, err := filefk.Write(afk.Seal(jsonFileKey[:0], ivfk, jsonFileKey, nil)); err != nil {
+		panic(err)
+	}
+}
+
+func ShowFiles(dataroompath string, username string, key []byte) {
+	admintoken := LoadAdminToken(key, dataroompath+"/.meta/"+username+"/AdminToken")
+
+	rk, err := hex.DecodeString(admintoken.RK)
+	if err != nil {
+		panic(err)
+	}
+
+	filekeys := LoadFileKeys(rk, dataroompath+"/.meta/Filekeys")
+
+	for key := range filekeys.Keys {
+		fmt.Println(key)
+	}
+}
+
+func DownloadFile(dataroompath string, filename string, dest string, username string, key []byte) {
+	admintoken := LoadAdminToken(key, dataroompath+"/.meta/"+username+"/AdminToken")
+
+	rk, err := hex.DecodeString(admintoken.RK)
+	if err != nil {
+		panic(err)
+	}
+
+	filekeys := LoadFileKeys(rk, dataroompath+"/.meta/Filekeys")
+
+	// check file exists
+	filekey, ok := filekeys.Keys[filename]
+	if ok {
+		if !validateFile(dataroompath + "/" + filekey[1]) {
+			fmt.Println("ERROR: File Key exists, but File " + filekey[1] + " not found")
+			os.Exit(1)
+		}
+	} else {
+		fmt.Println("File " + filename + " not found in dataroom " + dataroompath)
+		os.Exit(0)
+	}
+
+	// decrypt file
+	mode := ascon.Ascon128
+
+	fk, err := hex.DecodeString(filekey[0])
+	if err != nil {
+		panic(err)
+	}
+	a, err := ascon.New(fk, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	data, err := os.ReadFile(dataroompath + "/" + filekey[1])
+	if err != nil {
+		panic(err)
+	}
+
+	nonce, ciphertext := data[:a.NonceSize()], data[a.NonceSize():]
+
+	plain, err := a.Open(ciphertext[:0], nonce, ciphertext, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	err = os.WriteFile(dest+"/"+filename, plain, 0644)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func AddUser(dataroompath string, myusername string, key []byte, username string, pubkey kem.PublicKey) {
+	admintoken := LoadAdminToken(key, dataroompath+"/.meta/"+myusername+"/AdminToken")
+
+	// umständlich da bytes in AdminToken und dann wieder in bytes umgewandelt werden
+	jsonAdminToken, err := json.Marshal(admintoken)
+	if err != nil {
+		panic(err)
+	}
+
+	ct, ss, err := hybrid.Kyber768X25519().Encapsulate(pubkey)
+	if err != nil {
+		panic(err)
+	}
+
+	// encrypt + sign AdminToken
+	iv := make([]byte, 16)
+	if _, err := rand.Read(iv); err != nil {
+		panic(err)
+	}
+
+	mode := ascon.Ascon128
+	a, err := ascon.New(ss[:ascon.Ascon128.KeySize()], mode)
+	if err != nil {
+		panic(err)
+	}
+
+	// store AdminToken
+	err = os.WriteFile(dataroompath+"/.meta/"+username+"/AdminToken", iv, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	file, err := os.OpenFile(dataroompath+"/.meta/"+username+"/AdminToken", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+	if _, err := file.Write(a.Seal(jsonAdminToken[:0], iv, jsonAdminToken, nil)); err != nil {
+		panic(err)
+	}
+
+	// store ct
+	err = os.WriteFile(dataroompath+"/.meta/"+username+"/ct", ct, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	// load siging key
+	sk, err := hex.DecodeString(admintoken.SK)
+	if err != nil {
+		panic(err)
+	}
+
+	var signkey eddilithium3.PrivateKey
+	err = signkey.UnmarshalBinary(sk)
+	if err != nil {
+		panic(err)
+	}
+
+	// load permToken
+	permtoken := LoadPermToken(signkey.Public().(*eddilithium3.PublicKey), dataroompath+"/.meta/PermToken")
+
+	// add user + update version
+	permtoken.Perm[username] = 3
+	permtoken.Version++
+
+	jsonPermToken, err := json.Marshal(permtoken)
+	if err != nil {
+		panic(err)
+	}
+
+	// Sign perm token
+	var signature [eddilithium3.SignatureSize]byte
+	eddilithium3.SignTo(&signkey, jsonPermToken, signature[:])
+
+	err = os.WriteFile(dataroompath+"/.meta/PermToken.sig", signature[:], 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	f, err := os.OpenFile(dataroompath+"/.meta/PermToken", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	defer f.Close()
+
+	_, err = f.WriteString(string(jsonPermToken) + "\n")
+	if err != nil {
+		panic(err)
+	}
+}
+
+func LoadAdminToken(key []byte, sk kem.PrivateKey, path string) (admintoken AdminRoomToken) {
+	// check ct file
+	if validateFile(path + "/ct") {
+		ct, err := os.ReadFile(path + "/ct")
+		if err != nil {
+			panic(err)
+		}
+
+		// decrypt + verify sign
+		plain, err := hybrid.Kyber768X25519().Decapsulate(sk, ct)
+		if err != nil {
+			panic(err)
+		}
+
+		// delete ct + encrypt admin token with 
+	}
+
+
+	// read and decrypt AdminToken file
+	data, err := os.ReadFile(path + "/AdminToken")
+	if err != nil {
+		panic(err)
+	}
+
+	mode := ascon.Ascon128
+	a, err := ascon.New(key, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	nonce, ciphertext := data[:a.NonceSize()], data[a.NonceSize():]
+
+	plain, err := a.Open(ciphertext[:0], nonce, ciphertext, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	err = json.Unmarshal(plain, &admintoken)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+// eventuell mit LoadAdminToken zusamenfassen
+func LoadFileKeys(key []byte, file string) (filekeys FileKeys) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		panic(err)
+	}
+
+	mode := ascon.Ascon128
+	a, err := ascon.New(key, mode)
+	if err != nil {
+		panic(err)
+	}
+
+	nonce, ciphertext := data[:a.NonceSize()], data[a.NonceSize():]
+
+	plain, err := a.Open(ciphertext[:0], nonce, ciphertext, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	err = json.Unmarshal(plain, &filekeys)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func LoadPermToken(vk *eddilithium3.PublicKey, file string) (permtoken PermToken) {
+	// check perm token exists
+	if !validateFile(file) {
+		fmt.Println("File " + file + " not found")
+		os.Exit(1)
+	}
+
+	// check signature exists
+	if !validateFile(file + ".sig") {
+		fmt.Println("File " + file + ".sig not found")
+		os.Exit(1)
+	}
+
+	// load Perm Token
+	data, err := os.ReadFile(file)
+	if err != nil {
+		panic(err)
+	}
+
+	// load signature
+	sig, err := os.ReadFile(file + ".sig")
+	if err != nil {
+		panic(err)
+	}
+
+	// check signature
+	if eddilithium3.Verify(vk, data, sig[:]) {
+		panic("incorrect signature")
+	}
+
+	err = json.Unmarshal(data, &permtoken)
+	if err != nil {
+		panic(err)
+	}
+
+	return
+}
+
+func validateFile(file string) bool {
+	if _, err := os.Stat(file); os.IsNotExist(err) {
+		return false
+	}
+
+	return true
+}

@@ -1,0 +1,312 @@
+package main
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/cloudflare/circl/kem/hybrid"
+	"github.com/stsch9/ge2e/ge2e"
+)
+
+const usage = `Usage:
+	ge2e [-s KEYFILE_PATH] init USERNAME
+	ge2e [-s KEYFILE_PATH] mkdr DATAROOM_PATH
+	ge2e [-s KEYFILE_PATH] upload FILE_PATH DATAROOM_PATH
+	ge2e [-s KEYFILE_PATH] ls DATAROOM_PATH
+	ge2e [-s KEYFILE_PATH] download FILE_PATH DESTINATION
+	ge2e [-s KEYFILE_PATH] adduser DATAROOM_PATH USER_NAME PUBLIC_KEY_FILE
+	ge2e [-s KEYFILE_PATH] deluser DATAROOM_PATH USER_NAME
+	
+Options:
+	-s PATH		Path to Secret Key File. Default: secretkey
+	-f PATH		Path to factor File. Default: factor
+	-r PATH		Path to Recipient File. Default: recipient
+	-e PATH		Path to Encapsulation File. Default: <INPUT_File>.encap`
+
+func main() {
+	keyFlag := flag.String("s", "secretkey", "secret_key file path")
+
+	flag.Parse()
+
+	// If not enough args, return usage
+	if len(flag.Args()) < 1 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	function := flag.Arg(0)
+
+	switch function {
+	case "help":
+		fmt.Println(usage)
+		os.Exit(0)
+	case "init":
+		initHandle(*keyFlag)
+	case "mkdr":
+		mkdrHandle(*keyFlag)
+	case "upload":
+		uploadHandle(*keyFlag)
+	case "ls":
+		lsHandle(*keyFlag)
+	case "download":
+		downHandle(*keyFlag)
+	case "adduser":
+		adduserHandle(*keyFlag)
+	default:
+		fmt.Println("Run ge2e help to show usage.")
+		os.Exit(1)
+	}
+}
+
+func initHandle(keyfile string) {
+	if len(flag.Args()) != 2 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	if validateFile(keyfile) {
+		fmt.Println(keyfile + " already exists")
+		os.Exit(1)
+	}
+
+	username := flag.Arg(1)
+
+	// create symmetric key
+	fk := make([]byte, 16)
+	if _, err := rand.Read(fk); err != nil {
+		panic(err)
+	}
+
+	// create hybrid keypair
+	pk, sk, err := hybrid.Kyber768X25519().GenerateKeyPair()
+	if err != nil {
+		panic(err)
+	}
+
+	pkByte, err := pk.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+
+	skByte, err := sk.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+
+	hex.EncodeToString(pkByte)
+	hex.EncodeToString(skByte)
+
+	f, err := os.Create(keyfile)
+	if err != nil {
+		panic(err)
+	}
+
+	defer f.Close()
+
+	err = os.Chmod(keyfile, 0600)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = f.WriteString(username + ":" + hex.EncodeToString(fk) + ":" + hex.EncodeToString(skByte) + "\n")
+	if err != nil {
+		panic(err)
+	}
+
+	pkfile, err := os.Create("publickey")
+	if err != nil {
+		panic(err)
+	}
+
+	defer f.Close()
+
+	_, err = pkfile.WriteString(hex.EncodeToString(pkByte) + "\n")
+	if err != nil {
+		panic(err)
+	}
+}
+
+func mkdrHandle(keyfile string) {
+	if len(flag.Args()) != 2 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	dataroompath := flag.Arg(1)
+
+	if validateFile(dataroompath) {
+		fmt.Println(dataroompath + " already exists")
+		os.Exit(1)
+	}
+
+	username, key, _ := readKeyFile(keyfile)
+
+	if err := os.MkdirAll(dataroompath+"/.meta/"+username, os.ModePerm); err != nil {
+		panic(err)
+	}
+
+	ge2e.CreateDataroom(dataroompath, username, key)
+}
+
+func uploadHandle(keyfile string) {
+	if len(flag.Args()) != 3 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	file := flag.Arg(1)
+	dataroompath := flag.Arg(2)
+
+	if !validateFile(file) {
+		fmt.Println("File " + file + " not found")
+		os.Exit(1)
+	}
+
+	if !validateFile(dataroompath) {
+		fmt.Println("Dataroom " + dataroompath + " not found")
+		os.Exit(1)
+	}
+
+	username, key, _ := readKeyFile(keyfile)
+
+	ge2e.UploadFile(dataroompath, file, username, key)
+}
+
+func lsHandle(keyfile string) {
+	if len(flag.Args()) != 2 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	dataroompath := flag.Arg(1)
+
+	if !validateFile(dataroompath) {
+		fmt.Println("Dataroom " + dataroompath + " not found")
+		os.Exit(1)
+	}
+
+	username, key, _ := readKeyFile(keyfile)
+
+	ge2e.ShowFiles(dataroompath, username, key)
+}
+
+func downHandle(keyfile string) {
+	if len(flag.Args()) != 3 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	file := flag.Arg(1)
+	filename := filepath.Base(file)
+	dataroompath := filepath.Dir(file)
+	dest := flag.Arg(2)
+	dest2 := filepath.Clean(dest)
+
+	if !validateFile(dest) {
+		fmt.Println("Destination " + dest + " not found")
+		os.Exit(1)
+	}
+
+	if dataroompath == "." {
+		fmt.Println("Use a valid dataroom")
+		os.Exit(1)
+	}
+
+	if !validateFile(dataroompath) {
+		fmt.Println("Dataroom " + dataroompath + " not found")
+		os.Exit(1)
+	}
+
+	username, key, _ := readKeyFile(keyfile)
+
+	ge2e.DownloadFile(dataroompath, filename, dest2, username, key)
+}
+
+func adduserHandle(keyfile string) {
+	if len(flag.Args()) != 4 {
+		fmt.Println(usage)
+		os.Exit(0)
+	}
+
+	dataroompath := flag.Arg(1)
+
+	if !validateFile(dataroompath) {
+		fmt.Println("Dataroom " + dataroompath + " not found")
+		os.Exit(1)
+	}
+
+	username := flag.Arg(2)
+
+	pkfile := flag.Arg(3)
+	if !validateFile(pkfile) {
+		fmt.Println("publiic Key file " + pkfile + " not found")
+		os.Exit(1)
+	}
+
+	data, err := os.ReadFile(pkfile)
+	if err != nil {
+		panic(err)
+	}
+
+	pkhex := strings.TrimSuffix(string(data), "\n")
+
+	// validate public Key
+	pk, err := hex.DecodeString(pkhex)
+	if err != nil {
+		panic(err)
+	}
+
+	pubkey, err := hybrid.Kyber768X25519().UnmarshalBinaryPublicKey(pk)
+	if err != nil {
+		panic(err)
+	}
+
+	myusername, key, _ := readKeyFile(keyfile)
+
+	if err := os.MkdirAll(dataroompath+"/.meta/"+username, os.ModePerm); err != nil {
+		panic(err)
+	}
+	ge2e.AddUser(dataroompath, myusername, key, username, pubkey)
+}
+
+func validateFile(file string) bool {
+	if _, err := os.Stat(file); os.IsNotExist(err) {
+		return false
+	}
+
+	return true
+}
+
+func readKeyFile(keyfile string) (username string, key []byte, sk []byte) {
+	if !validateFile(keyfile) {
+		fmt.Println("File " + keyfile + " not found")
+		os.Exit(1)
+	}
+
+	data, err := os.ReadFile(keyfile)
+	if err != nil {
+		panic(err)
+	}
+
+	da := strings.Split(string(data), ":")
+	username = da[0]
+	k := da[1]
+	s := strings.TrimSuffix(da[2], "\n")
+
+	key, err = hex.DecodeString(k)
+	if err != nil {
+		panic(err)
+	}
+
+	sk, err = hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+
+	return
+}
