@@ -11,7 +11,7 @@ The user creates a dataroom directory `/PATH/TO/DATAROOM` and a  directory `/PAT
 The user creates a random ristretto255 key pair `(e, E)` and calculates
 
 ```
-shared_key = e * B
+shared_key = a * E
 ```
 
 where * denotes the scalar multiplication over the elliptic curve ristretto255.
