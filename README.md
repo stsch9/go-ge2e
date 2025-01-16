@@ -63,15 +63,43 @@ and stores the encrypted file with the name `fn` in `/PATH/TO/DATAROOM/fn`.
 Finally, the user encrypts the file `Filekeys` with a new ephemaral public key `E` (see above) and stores `Filekeys.enc` and `E` in `/PATH/TO/DATAROOM/.meta`.
 
 ## List all files stored in the dataroom
-...
+The User the user decrypts the file `Filekeys.enc` with the private dataroom key `a` and the ephemeral public `E` (see above). This allows the user to query all file names that are listed in the Filekeys file and are therefore in the dataroom.
 
 ## File download
+First, the user decrypts the file `Filekeys.enc` with the private dataroom key `a` and the ephemeral public `E` (see above).
 
-...
+The user then queries the filekey `fk` and the path to the encrypted file `fn` using the file filekeys.
 
+The file can now be decrypted using the file path `fn` and the file key `fk`.
 
+## Key Rotation
 
+Suppose the user wants to renew the dataroom key `a`. He generates a new random ristretto255 dataroom key pair `(b, B)`. In addition, a so-called `factor` file is created, which contains the scalar product of the multiplicative inverse of `b` and `a`:
 
+```
+factor =  b^-1 * a (mod L)
+```
+
+where L is L the order of the ristretto255 group: (2^252 + 27742317777372353535851937790883648493).
+
+The `factor` file is stored in the path `/PATH/TO/DATAROOM/.meta`.
+
+## Rekey
+
+The ephemeral public key `E` (stored in path `/PATH/TO/DATAROOM/.meta`) is multiplied by the `factor` generated during key rotation (see above):
+
+```
+F = factor * E
+```
+`E` is replaced by `F` in the path `/PATH/TO/DATAROOM/.meta`.
+
+This allows the user to decrypt the file `Keyfiles.enc` with his new private key `b`, since the user receives the same `shared_key` as before:
+
+```
+b * F = b * (factor * E) = b * ((b^-1 * a) * E) = a * E = shared_key
+```
+
+Since neither the new private key `b` nor the old private key `a` can be calculated from the `factor`, the rekey operation can be executed by an untrusted third party.
 
 ## Usage
 ...
